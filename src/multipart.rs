@@ -49,6 +49,7 @@ use tokio_util::codec::{BytesCodec, FramedRead};
 pub struct Multipart {
     state: Arc<Mutex<MultipartState>>,
     constraints: Constraints,
+    fallback_boundary: Option<String>,
 }
 
 impl Multipart {
@@ -81,7 +82,31 @@ impl Multipart {
         Multipart {
             state: Arc::new(Mutex::new(state)),
             constraints,
+            fallback_boundary: None,
         }
+    }
+
+    /// Set a raw fallback boundary to process.
+    /// 
+    /// This allows to process an arbitrary boundary if the boundary provided
+    /// in constructors fn fails to work, for instance, due to an
+    /// `IncompleteStream` error.
+    ///
+    /// Please provide a full boundary, including double hyphen, example:
+    /// `--single-boundary \r`
+    ///
+    /// The provided boundary is processed if default boundary fails.
+    ///
+    /// This does not check if boundary is standard compliant, that is to say,
+    /// there is no check on if received boundary starts with double hyphen and
+    /// ends with CRLF.
+    ///
+    /// **Note: This fn is meant to be used as a last resort when normal boundary
+    /// parse does not work.**
+    pub fn with_fallback_boundary(mut self, s: impl std::string::ToString) -> Multipart
+    {
+        self.fallback_boundary = Some(s.to_string());
+        self
     }
 
     /// Construct a new `Multipart` instance with the given [`Bytes`](https://docs.rs/bytes/0.5.4/bytes/struct.Bytes.html) stream and the boundary.
@@ -111,6 +136,7 @@ impl Multipart {
         Multipart {
             state: Arc::new(Mutex::new(state)),
             constraints,
+            fallback_boundary: None,
         }
     }
 
@@ -283,7 +309,9 @@ impl Stream for Multipart {
             let boundary_deriv_len = constants::BOUNDARY_EXT.len() + boundary.len() + 2;
 
             let boundary_bytes = match stream_buffer.read_exact(boundary_deriv_len) {
-                Some(bytes) => bytes,
+                Some(bytes) => {
+                    bytes
+                },
                 None => {
                     return if stream_buffer.eof {
                         Poll::Ready(Some(Err(crate::Error::IncompleteStream)))
@@ -301,7 +329,18 @@ impl Stream for Multipart {
             }
 
             if &boundary_bytes[..] != format!("{}{}{}", constants::BOUNDARY_EXT, boundary, constants::CRLF).as_bytes() {
-                return Poll::Ready(Some(Err(crate::Error::IncompleteStream)));
+                let mut fallback_failed = true;
+                if self.fallback_boundary.is_some() {
+                    let raw_boundary = self.fallback_boundary.as_ref().unwrap();
+                    if &boundary_bytes[..] == raw_boundary.as_bytes() {
+                        fallback_failed = false;
+                        state.stage = StreamingStage::ReadingFieldHeaders;
+                    }
+                }
+
+                if fallback_failed {
+                    return Poll::Ready(Some(Err(crate::Error::IncompleteStream)));
+                }
             } else {
                 state.stage = StreamingStage::ReadingFieldHeaders;
             }
